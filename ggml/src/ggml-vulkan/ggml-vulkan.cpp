@@ -14035,49 +14035,38 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 
             if (staging.use_sync_fd) {
                 // Tier 1: GPU-only synchronization via sync_fd
+#if !defined(_WIN32)
+                auto count_fds = []() -> int {
+                    int n = 0;
+                    DIR * d = opendir("/proc/self/fd");
+                    if (d) { while (readdir(d)) n++; closedir(d); n -= 3; }
+                    return n;
+                };
+                int fds_before = count_fds();
+#endif
+
                 hop1_ctx->seqs.back().back().signal_semaphores.push_back({ staging.src_sem, 0 });
                 ggml_vk_submit(hop1_ctx, {});
                 src_ctx->submit_pending = true;
 
-                // Export sync_fd from source semaphore
+#if !defined(_WIN32)
+                int fds_after_submit = count_fds();
+#endif
+
                 vk::SemaphoreGetFdInfoKHR get_fd_info{
                     staging.src_sem,
                     vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd
                 };
                 int sync_fd = src_dev->device.getSemaphoreFdKHR(get_fd_info);
 
-                GGML_LOG_DEBUG("ggml_vulkan: cross-device sync_fd: src_dev=%s dst_dev=%s "
-                               "nbytes=%zu sync_fd=%d src_sem=%p dst_compute_ctx=%p\n",
-                               src_dev->name.c_str(), dst_dev->name.c_str(),
-                               nbytes, sync_fd, (void *)(VkSemaphore)staging.src_sem,
-                               (void *)dst_compute_ctx.get());
+#if !defined(_WIN32)
+                int fds_after_export = count_fds();
+#endif
 
-                if (sync_fd == -1) {
-                    GGML_LOG_WARN("ggml_vulkan: WARNING: getSemaphoreFdKHR returned -1 "
-                                  "(signal already completed before export)\n");
-                }
-
-                // Per-copy dest semaphore (temporary import is consumed per wait)
                 vk_semaphore * dst_sem = ggml_vk_create_binary_semaphore(ctx);
 
-                GGML_LOG_DEBUG("ggml_vulkan: cross-device importing sync_fd=%d into dst_sem=%p "
-                               "(binary_semaphore_idx=%zu)\n",
-                               sync_fd, (void *)(VkSemaphore)dst_sem->s,
-                               ctx->binary_semaphore_idx);
-
-                // Count open fds to detect leaks
 #if !defined(_WIN32)
-                {
-                    int fd_count = 0;
-                    DIR * d = opendir("/proc/self/fd");
-                    if (d) {
-                        while (readdir(d)) { fd_count++; }
-                        closedir(d);
-                        fd_count -= 3; // subtract ., .., and the dirfd itself
-                    }
-                    GGML_LOG_DEBUG("ggml_vulkan: pre-import: sync_fd=%d open_fds=%d\n",
-                                   sync_fd, fd_count);
-                }
+                int fds_after_sem_create = count_fds();
 #endif
 
                 vk::ImportSemaphoreFdInfoKHR import_info{
@@ -14101,14 +14090,20 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
                     return false;
                 }
 
-                GGML_LOG_DEBUG("ggml_vulkan: cross-device import succeeded\n");
-
-                // Work around drivers that don't close the fd after import
-                // (spec says ownership transfers to the driver, but some leak it)
 #if !defined(_WIN32)
+                int fds_after_import = count_fds();
                 if (sync_fd >= 0) {
                     close(sync_fd);
                 }
+                int fds_after_close = count_fds();
+
+                GGML_LOG_DEBUG("ggml_vulkan: sync_fd fds: before=%d +submit=%d +export=%d "
+                               "+sem_create=%d +import=%d +close=%d\n",
+                               fds_before, fds_after_submit - fds_before,
+                               fds_after_export - fds_after_submit,
+                               fds_after_sem_create - fds_after_export,
+                               fds_after_import - fds_after_sem_create,
+                               fds_after_close - fds_after_import);
 #endif
 
                 dst_compute_ctx->s->wait_semaphores.push_back({ dst_sem->s, 0 });
